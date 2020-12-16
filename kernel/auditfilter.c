@@ -67,6 +67,24 @@ static struct list_head audit_rules_list[AUDIT_NR_FILTERS] = {
 
 DEFINE_MUTEX(audit_filter_mutex);
 
+static void audit_free_lsm_field(struct audit_field *f)
+{
+	switch (f->type) {
+	case AUDIT_SUBJ_USER:
+	case AUDIT_SUBJ_ROLE:
+	case AUDIT_SUBJ_TYPE:
+	case AUDIT_SUBJ_SEN:
+	case AUDIT_SUBJ_CLR:
+	case AUDIT_OBJ_USER:
+	case AUDIT_OBJ_ROLE:
+	case AUDIT_OBJ_TYPE:
+	case AUDIT_OBJ_LEV_LOW:
+	case AUDIT_OBJ_LEV_HIGH:
+		kfree(f->lsm_str);
+		security_audit_rule_free(f->lsm_rule);
+	}
+}
+
 static inline void audit_free_rule(struct audit_entry *e)
 {
 	int i;
@@ -76,11 +94,8 @@ static inline void audit_free_rule(struct audit_entry *e)
 	if (erule->watch)
 		audit_put_watch(erule->watch);
 	if (erule->fields)
-		for (i = 0; i < erule->field_count; i++) {
-			struct audit_field *f = &erule->fields[i];
-			kfree(f->lsm_str);
-			security_audit_rule_free(f->lsm_rule);
-		}
+		for (i = 0; i < erule->field_count; i++)
+			audit_free_lsm_field(&erule->fields[i]);
 	kfree(erule->fields);
 	kfree(erule->filterkey);
 	kfree(e);
@@ -408,6 +423,7 @@ static struct audit_entry *audit_data_to_entry(struct audit_rule_data *data,
 	entry->rule.vers_ops = 2;
 	for (i = 0; i < data->field_count; i++) {
 		struct audit_field *f = &entry->rule.fields[i];
+		u32 f_val;
 
 		err = -EINVAL;
 
@@ -416,16 +432,13 @@ static struct audit_entry *audit_data_to_entry(struct audit_rule_data *data,
 			goto exit_free;
 
 		f->type = data->fields[i];
-		f->val = data->values[i];
-		f->uid = INVALID_UID;
-		f->gid = INVALID_GID;
-		f->lsm_str = NULL;
-		f->lsm_rule = NULL;
+		f_val = data->values[i];
 
 		/* Support legacy tests for a valid loginuid */
-		if ((f->type == AUDIT_LOGINUID) && (f->val == 4294967295u)) {
+		if ((f->type == AUDIT_LOGINUID) && (f_val == AUDIT_UID_UNSET)) {
 			f->type = AUDIT_LOGINUID_SET;
-			f->val = 0;
+			f_val = 0;
+			entry->rule.pflags |= AUDIT_LOGINUID_LEGACY;
 		}
 
 		err = audit_field_valid(entry, f);
@@ -440,7 +453,7 @@ static struct audit_entry *audit_data_to_entry(struct audit_rule_data *data,
 		case AUDIT_SUID:
 		case AUDIT_FSUID:
 		case AUDIT_OBJ_UID:
-			f->uid = make_kuid(current_user_ns(), f->val);
+			f->uid = make_kuid(current_user_ns(), f_val);
 			if (!uid_valid(f->uid))
 				goto exit_free;
 			break;
@@ -449,11 +462,12 @@ static struct audit_entry *audit_data_to_entry(struct audit_rule_data *data,
 		case AUDIT_SGID:
 		case AUDIT_FSGID:
 		case AUDIT_OBJ_GID:
-			f->gid = make_kgid(current_user_ns(), f->val);
+			f->gid = make_kgid(current_user_ns(), f_val);
 			if (!gid_valid(f->gid))
 				goto exit_free;
 			break;
 		case AUDIT_ARCH:
+			f->val = f_val;
 			entry->rule.arch_f = f;
 			break;
 		case AUDIT_SUBJ_USER:
@@ -466,11 +480,13 @@ static struct audit_entry *audit_data_to_entry(struct audit_rule_data *data,
 		case AUDIT_OBJ_TYPE:
 		case AUDIT_OBJ_LEV_LOW:
 		case AUDIT_OBJ_LEV_HIGH:
-			str = audit_unpack_string(&bufp, &remain, f->val);
-			if (IS_ERR(str))
+			str = audit_unpack_string(&bufp, &remain, f_val);
+			if (IS_ERR(str)) {
+				err = PTR_ERR(str);
 				goto exit_free;
-			entry->rule.buflen += f->val;
-
+			}
+			entry->rule.buflen += f_val;
+			f->lsm_str = str;
 			err = security_audit_rule_init(f->type, f->op, str,
 						       (void **)&f->lsm_rule);
 			/* Keep currently invalid fields around in case they
@@ -479,49 +495,53 @@ static struct audit_entry *audit_data_to_entry(struct audit_rule_data *data,
 				printk(KERN_WARNING "audit rule for LSM "
 				       "\'%s\' is invalid\n",  str);
 				err = 0;
-			}
-			if (err) {
-				kfree(str);
+			} else if (err)
 				goto exit_free;
-			} else
-				f->lsm_str = str;
 			break;
 		case AUDIT_WATCH:
-			str = audit_unpack_string(&bufp, &remain, f->val);
-			if (IS_ERR(str))
+			str = audit_unpack_string(&bufp, &remain, f_val);
+			if (IS_ERR(str)) {
+				err = PTR_ERR(str);
 				goto exit_free;
-			entry->rule.buflen += f->val;
-
-			err = audit_to_watch(&entry->rule, str, f->val, f->op);
+			}
+			err = audit_to_watch(&entry->rule, str, f_val, f->op);
 			if (err) {
 				kfree(str);
 				goto exit_free;
 			}
+			entry->rule.buflen += f_val;
 			break;
 		case AUDIT_DIR:
-			str = audit_unpack_string(&bufp, &remain, f->val);
-			if (IS_ERR(str))
+			str = audit_unpack_string(&bufp, &remain, f_val);
+			if (IS_ERR(str)) {
+				err = PTR_ERR(str);
 				goto exit_free;
-			entry->rule.buflen += f->val;
-
+			}
 			err = audit_make_tree(&entry->rule, str, f->op);
 			kfree(str);
 			if (err)
 				goto exit_free;
+			entry->rule.buflen += f_val;
 			break;
 		case AUDIT_INODE:
+			f->val = f_val;
 			err = audit_to_inode(&entry->rule, f);
 			if (err)
 				goto exit_free;
 			break;
 		case AUDIT_FILTERKEY:
-			if (entry->rule.filterkey || f->val > AUDIT_MAX_KEY_LEN)
+			if (entry->rule.filterkey || f_val > AUDIT_MAX_KEY_LEN)
 				goto exit_free;
-			str = audit_unpack_string(&bufp, &remain, f->val);
-			if (IS_ERR(str))
+			str = audit_unpack_string(&bufp, &remain, f_val);
+			if (IS_ERR(str)) {
+				err = PTR_ERR(str);
 				goto exit_free;
-			entry->rule.buflen += f->val;
+			}
+			entry->rule.buflen += f_val;
 			entry->rule.filterkey = str;
+			break;
+		default:
+			f->val = f_val;
 			break;
 		}
 	}
@@ -601,6 +621,13 @@ static struct audit_rule_data *audit_krule_to_data(struct audit_krule *krule)
 			data->buflen += data->values[i] =
 				audit_pack_string(&bufp, krule->filterkey);
 			break;
+		case AUDIT_LOGINUID_SET:
+			if (krule->pflags & AUDIT_LOGINUID_LEGACY && !f->val) {
+				data->fields[i] = AUDIT_LOGINUID;
+				data->values[i] = AUDIT_UID_UNSET;
+				break;
+			}
+			/* fallthrough if set */
 		default:
 			data->values[i] = f->val;
 		}
@@ -617,6 +644,7 @@ static int audit_compare_rule(struct audit_krule *a, struct audit_krule *b)
 	int i;
 
 	if (a->flags != b->flags ||
+	    a->pflags != b->pflags ||
 	    a->listnr != b->listnr ||
 	    a->action != b->action ||
 	    a->field_count != b->field_count)
@@ -735,6 +763,7 @@ struct audit_entry *audit_dupe_rule(struct audit_krule *old)
 	new = &entry->rule;
 	new->vers_ops = old->vers_ops;
 	new->flags = old->flags;
+	new->pflags = old->pflags;
 	new->listnr = old->listnr;
 	new->action = old->action;
 	for (i = 0; i < AUDIT_BITMASK_SIZE; i++)

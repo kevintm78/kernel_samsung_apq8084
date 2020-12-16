@@ -40,7 +40,8 @@ static bool ipv6_mapped_addr_any(const struct in6_addr *a)
 	return ipv6_addr_v4mapped(a) && (a->s6_addr32[3] == 0);
 }
 
-static int __ip6_datagram_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+int __ip6_datagram_connect(struct sock *sk, struct sockaddr *uaddr,
+			   int addr_len)
 {
 	struct sockaddr_in6	*usin = (struct sockaddr_in6 *) uaddr;
 	struct inet_sock      	*inet = inet_sk(sk);
@@ -207,6 +208,7 @@ out:
 	fl6_sock_release(flowlabel);
 	return err;
 }
+EXPORT_SYMBOL_GPL(__ip6_datagram_connect);
 
 int ip6_datagram_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 {
@@ -336,7 +338,7 @@ int ipv6_recv_error(struct sock *sk, struct msghdr *msg, int len, int *addr_len)
 	struct ipv6_pinfo *np = inet6_sk(sk);
 	struct sock_exterr_skb *serr;
 	struct sk_buff *skb, *skb2;
-	struct sockaddr_in6 *sin;
+	DECLARE_SOCKADDR(struct sockaddr_in6 *, sin, msg->msg_name);
 	struct {
 		struct sock_extended_err ee;
 		struct sockaddr_in6	 offender;
@@ -362,7 +364,6 @@ int ipv6_recv_error(struct sock *sk, struct msghdr *msg, int len, int *addr_len)
 
 	serr = SKB_EXT_ERR(skb);
 
-	sin = (struct sockaddr_in6 *)msg->msg_name;
 	if (sin) {
 		const unsigned char *nh = skb_network_header(skb);
 		sin->sin6_family = AF_INET6;
@@ -439,8 +440,8 @@ int ipv6_recv_rxpmtu(struct sock *sk, struct msghdr *msg, int len,
 {
 	struct ipv6_pinfo *np = inet6_sk(sk);
 	struct sk_buff *skb;
-	struct sockaddr_in6 *sin;
 	struct ip6_mtuinfo mtu_info;
+	DECLARE_SOCKADDR(struct sockaddr_in6 *, sin, msg->msg_name);
 	int err;
 	int copied;
 
@@ -462,7 +463,6 @@ int ipv6_recv_rxpmtu(struct sock *sk, struct msghdr *msg, int len,
 
 	memcpy(&mtu_info, IP6CBMTU(skb), sizeof(mtu_info));
 
-	sin = (struct sockaddr_in6 *)msg->msg_name;
 	if (sin) {
 		sin->sin6_family = AF_INET6;
 		sin->sin6_flowinfo = 0;

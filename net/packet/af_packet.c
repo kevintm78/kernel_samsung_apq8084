@@ -51,7 +51,6 @@
  *		2 of the License, or (at your option) any later version.
  *
  */
-
 #include <linux/types.h>
 #include <linux/mm.h>
 #include <linux/capability.h>
@@ -88,7 +87,8 @@
 #include <linux/virtio_net.h>
 #include <linux/errqueue.h>
 #include <linux/net_tstamp.h>
-
+#include <linux/percpu.h>
+#include <linux/if_arp.h>
 #ifdef CONFIG_INET
 #include <net/inet_common.h>
 #endif
@@ -517,7 +517,8 @@ static int prb_calc_retire_blk_tmo(struct packet_sock *po,
 			msec = 1;
 			div = speed / 1000;
 		}
-	}
+	} else
+		return DEFAULT_PRB_RETIRE_TOV;
 
 	mbits = (blk_size_in_bytes * 8) / (1024 * 1024);
 
@@ -1112,6 +1113,47 @@ static void packet_increment_head(struct packet_ring_buffer *buff)
 	buff->head = buff->head != buff->frame_max ? buff->head+1 : 0;
 }
 
+static void packet_inc_pending(struct packet_ring_buffer *rb)
+{
+	this_cpu_inc(*rb->pending_refcnt);
+}
+
+static void packet_dec_pending(struct packet_ring_buffer *rb)
+{
+	this_cpu_dec(*rb->pending_refcnt);
+}
+
+static unsigned int packet_read_pending(const struct packet_ring_buffer *rb)
+{
+	unsigned int refcnt = 0;
+	int cpu;
+
+	/* We don't use pending refcount in rx_ring. */
+	if (rb->pending_refcnt == NULL)
+		return 0;
+
+	for_each_possible_cpu(cpu)
+		refcnt += *per_cpu_ptr(rb->pending_refcnt, cpu);
+
+	return refcnt;
+}
+
+static int packet_alloc_pending(struct packet_sock *po)
+{
+	po->rx_ring.pending_refcnt = NULL;
+
+	po->tx_ring.pending_refcnt = alloc_percpu(unsigned int);
+	if (unlikely(po->tx_ring.pending_refcnt == NULL))
+		return -ENOBUFS;
+
+	return 0;
+}
+
+static void packet_free_pending(struct packet_sock *po)
+{
+	free_percpu(po->tx_ring.pending_refcnt);
+}
+
 static bool packet_rcv_has_room(struct packet_sock *po, struct sk_buff *skb)
 {
 	struct sock *sk = &po->sk;
@@ -1398,6 +1440,20 @@ static struct packet_fanout *fanout_release(struct sock *sk)
 	return f;
 }
 
+static bool packet_extra_vlan_len_allowed(const struct net_device *dev,
+					  struct sk_buff *skb)
+{
+	/* Earlier code assumed this would be a VLAN pkt, double-check
+	 * this now that we have the actual packet in hand. We can only
+	 * do this check on Ethernet devices.
+	 */
+	if (unlikely(dev->type != ARPHRD_ETHER))
+		return false;
+
+	skb_reset_mac_header(skb);
+	return likely(eth_hdr(skb)->h_proto == htons(ETH_P_8021Q));
+}
+
 static const struct proto_ops packet_ops;
 
 static const struct proto_ops packet_ops_spkt;
@@ -1478,7 +1534,7 @@ static int packet_sendmsg_spkt(struct kiocb *iocb, struct socket *sock,
 			       struct msghdr *msg, size_t len)
 {
 	struct sock *sk = sock->sk;
-	struct sockaddr_pkt *saddr = (struct sockaddr_pkt *)msg->msg_name;
+	DECLARE_SOCKADDR(struct sockaddr_pkt *, saddr, msg->msg_name);
 	struct sk_buff *skb = NULL;
 	struct net_device *dev;
 	__be16 proto = 0;
@@ -1559,18 +1615,10 @@ retry:
 		goto retry;
 	}
 
-	if (len > (dev->mtu + dev->hard_header_len + extra_len)) {
-		/* Earlier code assumed this would be a VLAN pkt,
-		 * double-check this now that we have the actual
-		 * packet in hand.
-		 */
-		struct ethhdr *ehdr;
-		skb_reset_mac_header(skb);
-		ehdr = eth_hdr(skb);
-		if (ehdr->h_proto != htons(ETH_P_8021Q)) {
-			err = -EMSGSIZE;
-			goto out_unlock;
-		}
+	if (len > (dev->mtu + dev->hard_header_len + extra_len) &&
+	    !packet_extra_vlan_len_allowed(dev, skb)) {
+		err = -EMSGSIZE;
+		goto out_unlock;
 	}
 
 	skb->protocol = proto;
@@ -1959,8 +2007,7 @@ static void tpacket_destruct_skb(struct sk_buff *skb)
 		__u32 ts;
 
 		ph = skb_shinfo(skb)->destructor_arg;
-		BUG_ON(atomic_read(&po->tx_ring.pending) == 0);
-		atomic_dec(&po->tx_ring.pending);
+		packet_dec_pending(&po->tx_ring);
 
 		ts = __packet_set_timestamp(po, ph, skb);
 		__packet_set_status(po, ph, TP_STATUS_AVAILABLE | ts);
@@ -2099,15 +2146,23 @@ static int tpacket_snd(struct packet_sock *po, struct msghdr *msg)
 	__be16 proto;
 	int err, reserve = 0;
 	void *ph;
-	struct sockaddr_ll *saddr = (struct sockaddr_ll *)msg->msg_name;
+	DECLARE_SOCKADDR(struct sockaddr_ll *, saddr, msg->msg_name);
+	bool need_wait = !(msg->msg_flags & MSG_DONTWAIT);
+	unsigned char *addr = NULL;
 	int tp_len, size_max;
-	unsigned char *addr;
 	int len_sum = 0;
 	int status = TP_STATUS_AVAILABLE;
 	int hlen, tlen;
 
 	mutex_lock(&po->pg_vec_lock);
 
+	/* packet_sendmsg() check on tx_ring.pg_vec was lockless,
+	 * we need to confirm it under protection of pg_vec_lock.
+	 */
+	if (unlikely(!po->tx_ring.pg_vec)) {
+		err = -EBUSY;
+		goto out;
+	}
 	if (likely(saddr == NULL)) {
 		dev	= packet_cached_dev_get(po);
 		proto	= po->num;
@@ -2121,8 +2176,13 @@ static int tpacket_snd(struct packet_sock *po, struct msghdr *msg)
 						sll_addr)))
 			goto out;
 		proto	= saddr->sll_protocol;
-		addr	= saddr->sll_addr;
 		dev = dev_get_by_index(sock_net(&po->sk), saddr->sll_ifindex);
+		if (po->sk.sk_socket->type == SOCK_DGRAM) {
+			if (dev && msg->msg_namelen < dev->addr_len +
+				   offsetof(struct sockaddr_ll, sll_addr))
+				goto out_put;
+			addr = saddr->sll_addr;
+		}
 	}
 
 	err = -ENXIO;
@@ -2132,20 +2192,20 @@ static int tpacket_snd(struct packet_sock *po, struct msghdr *msg)
 	if (unlikely(!(dev->flags & IFF_UP)))
 		goto out_put;
 
-	reserve = dev->hard_header_len;
-
+	if (po->sk.sk_socket->type == SOCK_RAW)
+		reserve = dev->hard_header_len;
 	size_max = po->tx_ring.frame_size
 		- (po->tp_hdrlen - sizeof(struct sockaddr_ll));
 
-	if (size_max > dev->mtu + reserve)
-		size_max = dev->mtu + reserve;
+	if (size_max > dev->mtu + reserve + VLAN_HLEN)
+		size_max = dev->mtu + reserve + VLAN_HLEN;
 
 	do {
 		ph = packet_current_frame(po, &po->tx_ring,
-				TP_STATUS_SEND_REQUEST);
-
+					  TP_STATUS_SEND_REQUEST);
 		if (unlikely(ph == NULL)) {
-			schedule();
+			if (need_wait && need_resched())
+				schedule();
 			continue;
 		}
 
@@ -2160,7 +2220,11 @@ static int tpacket_snd(struct packet_sock *po, struct msghdr *msg)
 			goto out_status;
 
 		tp_len = tpacket_fill_skb(po, skb, ph, dev, size_max, proto,
-				addr, hlen);
+					  addr, hlen);
+		if (likely(tp_len >= 0) &&
+		    tp_len > dev->mtu + reserve &&
+		    !packet_extra_vlan_len_allowed(dev, skb))
+			tp_len = -EMSGSIZE;
 
 		if (unlikely(tp_len < 0)) {
 			if (po->tp_loss) {
@@ -2178,7 +2242,7 @@ static int tpacket_snd(struct packet_sock *po, struct msghdr *msg)
 
 		skb->destructor = tpacket_destruct_skb;
 		__packet_set_status(po, ph, TP_STATUS_SENDING);
-		atomic_inc(&po->tx_ring.pending);
+		packet_inc_pending(&po->tx_ring);
 
 		status = TP_STATUS_SEND_REQUEST;
 		err = dev_queue_xmit(skb);
@@ -2199,9 +2263,13 @@ static int tpacket_snd(struct packet_sock *po, struct msghdr *msg)
 		packet_increment_head(&po->tx_ring);
 		len_sum += tp_len;
 	} while (likely((ph != NULL) ||
-			((!(msg->msg_flags & MSG_DONTWAIT)) &&
-			 (atomic_read(&po->tx_ring.pending))))
-		);
+		/* Note: packet_read_pending() might be slow if we have
+		 * to call it as it's per_cpu variable, but in fast-path
+		 * we already short-circuit the loop with the first
+		 * condition, and luckily don't have to go that path
+		 * anyway.
+		 */
+		 (need_wait && packet_read_pending(&po->tx_ring))));
 
 	err = len_sum;
 	goto out_put;
@@ -2244,11 +2312,11 @@ static int packet_snd(struct socket *sock,
 			  struct msghdr *msg, size_t len)
 {
 	struct sock *sk = sock->sk;
-	struct sockaddr_ll *saddr = (struct sockaddr_ll *)msg->msg_name;
+	DECLARE_SOCKADDR(struct sockaddr_ll *, saddr, msg->msg_name);
 	struct sk_buff *skb;
 	struct net_device *dev;
 	__be16 proto;
-	unsigned char *addr;
+	unsigned char *addr = NULL;
 	int err, reserve = 0;
 	struct virtio_net_hdr vnet_hdr = { 0 };
 	int offset = 0;
@@ -2265,7 +2333,6 @@ static int packet_snd(struct socket *sock,
 	if (likely(saddr == NULL)) {
 		dev	= packet_cached_dev_get(po);
 		proto	= po->num;
-		addr	= NULL;
 	} else {
 		err = -EINVAL;
 		if (msg->msg_namelen < sizeof(struct sockaddr_ll))
@@ -2273,8 +2340,13 @@ static int packet_snd(struct socket *sock,
 		if (msg->msg_namelen < (saddr->sll_halen + offsetof(struct sockaddr_ll, sll_addr)))
 			goto out;
 		proto	= saddr->sll_protocol;
-		addr	= saddr->sll_addr;
 		dev = dev_get_by_index(sock_net(sk), saddr->sll_ifindex);
+		if (sock->type == SOCK_DGRAM) {
+			if (dev && msg->msg_namelen < dev->addr_len +
+				   offsetof(struct sockaddr_ll, sll_addr))
+				goto out_unlock;
+			addr = saddr->sll_addr;
+		}
 	}
 
 	err = -ENXIO;
@@ -2370,18 +2442,10 @@ static int packet_snd(struct socket *sock,
 
 	sock_tx_timestamp(sk, &skb_shinfo(skb)->tx_flags);
 
-	if (!gso_type && (len > dev->mtu + reserve + extra_len)) {
-		/* Earlier code assumed this would be a VLAN pkt,
-		 * double-check this now that we have the actual
-		 * packet in hand.
-		 */
-		struct ethhdr *ehdr;
-		skb_reset_mac_header(skb);
-		ehdr = eth_hdr(skb);
-		if (ehdr->h_proto != htons(ETH_P_8021Q)) {
-			err = -EMSGSIZE;
-			goto out_free;
-		}
+	if (!gso_type && (len > dev->mtu + reserve + extra_len) &&
+	    !packet_extra_vlan_len_allowed(dev, skb)) {
+		err = -EMSGSIZE;
+		goto out_free;
 	}
 
 	skb->protocol = proto;
@@ -2512,6 +2576,7 @@ static int packet_release(struct socket *sock)
 	/* Purge queues */
 
 	skb_queue_purge(&sk->sk_receive_queue);
+	packet_free_pending(po);
 	sk_refcnt_debug_release(sk);
 
 	sock_put(sk);
@@ -2668,6 +2733,10 @@ static int packet_create(struct net *net, struct socket *sock, int protocol,
 	sk->sk_family = PF_PACKET;
 	po->num = proto;
 
+	err = packet_alloc_pending(po);
+	if (err)
+		goto out2;
+
 	packet_cached_dev_reset(po);
 
 	sk->sk_destruct = packet_sock_destruct;
@@ -2700,6 +2769,8 @@ static int packet_create(struct net *net, struct socket *sock, int protocol,
 	preempt_enable();
 
 	return 0;
+out2:
+	sk_free(sk);
 out:
 	return err;
 }
@@ -2865,6 +2936,7 @@ static int packet_recvmsg(struct kiocb *iocb, struct socket *sock,
 		 * in, we fill it in now.
 		 */
 		if (sock->type == SOCK_PACKET) {
+			__sockaddr_check_size(sizeof(struct sockaddr_pkt));
 			msg->msg_namelen = sizeof(struct sockaddr_pkt);
 			copy_len = msg->msg_namelen;
 		} else {
@@ -3685,7 +3757,7 @@ static int packet_set_ring(struct sock *sk, union tpacket_req_u *req_u,
 	if (!closing) {
 		if (atomic_read(&po->mapped))
 			goto out;
-		if (atomic_read(&rb->pending))
+		if (packet_read_pending(rb))
 			goto out;
 	}
 

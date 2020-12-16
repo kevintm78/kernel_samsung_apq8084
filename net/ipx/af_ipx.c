@@ -1367,7 +1367,7 @@ static int ipx_create(struct net *net, struct socket *sock, int protocol,
 
 	sk_refcnt_debug_inc(sk);
 	sock_init_data(sock, sk);
-	sk->sk_no_check = 1;		/* Checksum off by default */
+	sk->sk_no_check_tx = 1;		/* Checksum off by default */
 	sock->ops = &ipx_dgram_ops;
 	rc = 0;
 out:
@@ -1706,7 +1706,7 @@ static int ipx_sendmsg(struct kiocb *iocb, struct socket *sock,
 {
 	struct sock *sk = sock->sk;
 	struct ipx_sock *ipxs = ipx_sk(sk);
-	struct sockaddr_ipx *usipx = (struct sockaddr_ipx *)msg->msg_name;
+	DECLARE_SOCKADDR(struct sockaddr_ipx *, usipx, msg->msg_name);
 	struct sockaddr_ipx local_sipx;
 	int rc = -EINVAL;
 	int flags = msg->msg_flags;
@@ -1773,7 +1773,7 @@ static int ipx_recvmsg(struct kiocb *iocb, struct socket *sock,
 {
 	struct sock *sk = sock->sk;
 	struct ipx_sock *ipxs = ipx_sk(sk);
-	struct sockaddr_ipx *sipx = (struct sockaddr_ipx *)msg->msg_name;
+	DECLARE_SOCKADDR(struct sockaddr_ipx *, sipx, msg->msg_name);
 	struct ipxhdr *ipx = NULL;
 	struct sk_buff *skb;
 	int copied, rc;

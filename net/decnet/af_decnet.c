@@ -481,7 +481,7 @@ static struct sock *dn_alloc_sock(struct net *net, struct socket *sock, gfp_t gf
 
 	sk->sk_backlog_rcv = dn_nsp_backlog_rcv;
 	sk->sk_destruct    = dn_destruct;
-	sk->sk_no_check    = 1;
+	sk->sk_no_check_tx = 1;
 	sk->sk_family      = PF_DECnet;
 	sk->sk_protocol    = 0;
 	sk->sk_allocation  = gfp;
@@ -1811,6 +1811,7 @@ out:
 		rv = (flags & MSG_PEEK) ? -sk->sk_err : sock_error(sk);
 
 	if ((rv >= 0) && msg->msg_name) {
+		__sockaddr_check_size(sizeof(struct sockaddr_dn));
 		memcpy(msg->msg_name, &scp->peer, sizeof(struct sockaddr_dn));
 		msg->msg_namelen = sizeof(struct sockaddr_dn);
 	}
@@ -1917,7 +1918,7 @@ static int dn_sendmsg(struct kiocb *iocb, struct socket *sock,
 	int err = 0;
 	size_t sent = 0;
 	int addr_len = msg->msg_namelen;
-	struct sockaddr_dn *addr = (struct sockaddr_dn *)msg->msg_name;
+	DECLARE_SOCKADDR(struct sockaddr_dn *, addr, msg->msg_name);
 	struct sk_buff *skb = NULL;
 	struct dn_skb_cb *cb;
 	size_t len;

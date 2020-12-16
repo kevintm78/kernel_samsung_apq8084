@@ -46,6 +46,7 @@ struct audit_tree;
 
 struct audit_krule {
 	int			vers_ops;
+	u32			pflags;
 	u32			flags;
 	u32			listnr;
 	u32			action;
@@ -63,14 +64,21 @@ struct audit_krule {
 	u64			prio;
 };
 
+/* Flag to indicate legacy AUDIT_LOGINUID unset usage */
+#define AUDIT_LOGINUID_LEGACY		0x1
+
 struct audit_field {
 	u32				type;
-	u32				val;
-	kuid_t				uid;
-	kgid_t				gid;
+	union {
+		u32			val;
+		kuid_t			uid;
+		kgid_t			gid;
+		struct {
+			char		*lsm_str;
+			void		*lsm_rule;
+		};
+	};
 	u32				op;
-	char				*lsm_str;
-	void				*lsm_rule;
 };
 
 extern int __init audit_register_class(int class, unsigned *list);
